@@ -93,8 +93,4 @@ Les contributions sont les bienvenues !
 
 Pour toute question ou suggestion, veuillez ouvrir une issue sur le dépôt GitHub ou contacter [davidweb](https://github.com/davidweb).
 
----
 
-N'hésite pas à adapter ce fichier `README.md` en fonction des évolutions de ton projet ou des spécificités supplémentaires que tu souhaites mettre en avant.
-
-[1]: https://github.com/davidweb?utm_source=chatgpt.com "davidweb (Neorak) · GitHub"
