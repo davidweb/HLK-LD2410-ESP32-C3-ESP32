@@ -1,11 +1,5 @@
 # Module-surveillance-v1-
 
-Voici un fichier `README.md` structuré pour ton dépôt GitHub [Module-surveillance-v1-](https://github.com/davidweb/Module-surveillance-v1-), rédigé en français et adapté à ton projet de surveillance basé sur des modules ESP32-C3 et un ESP32-WROOM-32 en tant que maître :
-
----
-
-# Module-surveillance-v1-
-
 Système de surveillance intelligent basé sur des capteurs radar HLK-LD2410, conçu pour détecter la présence humaine, surveiller les postures (debout, assis, couché) et alerter en cas de chute. Chaque module capteur est piloté par un ESP32-C3, tandis qu'un ESP32-WROOM-32 centralise les données et gère les alertes.
 
 ## 🧠 Objectif du projet
