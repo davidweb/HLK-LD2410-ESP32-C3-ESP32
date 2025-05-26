@@ -1,1 +1,106 @@
 # Module-surveillance-v1-
+
+Voici un fichier `README.md` structuré pour ton dépôt GitHub [Module-surveillance-v1-](https://github.com/davidweb/Module-surveillance-v1-), rédigé en français et adapté à ton projet de surveillance basé sur des modules ESP32-C3 et un ESP32-WROOM-32 en tant que maître :
+
+---
+
+# Module-surveillance-v1-
+
+Système de surveillance intelligent basé sur des capteurs radar HLK-LD2410, conçu pour détecter la présence humaine, surveiller les postures (debout, assis, couché) et alerter en cas de chute. Chaque module capteur est piloté par un ESP32-C3, tandis qu'un ESP32-WROOM-32 centralise les données et gère les alertes.
+
+## 🧠 Objectif du projet
+
+Fournir une solution de surveillance non intrusive pour assurer la sécurité des personnes, notamment des personnes âgées, en détectant les chutes et en surveillant les activités dans différentes pièces.
+
+## 🧩 Architecture du système
+
+* **Modules capteurs (ESP32-C3)** :
+
+  * Connectés à des capteurs radar HLK-LD2410 via UART.
+  * Mesurent la distance et la posture des individus.
+  * Envoient les données via Wi-Fi au module maître.
+
+* **Module maître (ESP32-WROOM-32)** :
+
+  * Reçoit les données des modules capteurs.
+  * Fusionne les informations pour déterminer la position et la posture.
+  * Détecte les chutes et envoie des alertes via MQTT ou autres moyens.
+
+## 🔧 Matériel requis
+
+* 2 × ESP32-C3 (modules capteurs)
+* 1 × ESP32-WROOM-32 (module maître)
+* 2 × Capteurs radar HLK-LD2410
+* Alimentation 5V pour chaque module
+* Connexion Wi-Fi stable
+
+## 🛠️ Installation et configuration
+
+1. **Cloner le dépôt** :
+
+   ```bash
+   git clone https://github.com/davidweb/Module-surveillance-v1-.git
+   ```
+
+2. **Configurer les modules capteurs** :
+
+   * Flasher le firmware sur chaque ESP32-C3.
+   * Connecter les capteurs HLK-LD2410 via UART.
+   * Configurer les paramètres Wi-Fi.
+
+3. **Configurer le module maître** :
+
+   * Flasher le firmware sur l'ESP32-WROOM-32.
+   * Configurer les paramètres Wi-Fi et MQTT.
+
+4. **Démarrer le système** :
+
+   * Alimenter les modules.
+   * Vérifier la communication entre les modules capteurs et le maître.
+   * Surveiller les alertes via le broker MQTT ou l'interface prévue.
+
+## 📁 Structure du dépôt
+
+```
+Module-surveillance-v1-/
+├── capteur/
+│   ├── main/
+│   │   ├── capteur.c
+│   │   └── ...
+│   └── ...
+├── maitre/
+│   ├── main/
+│   │   ├── maitre.c
+│   │   └── ...
+│   └── ...
+├── docs/
+│   └── schema_architecture.png
+├── README.md
+└── ...
+```
+
+
+
+## 📜 Licence
+
+Ce projet est sous licence MIT. Voir le fichier [LICENSE](LICENSE) pour plus d'informations.
+
+## 🤝 Contribuer
+
+Les contributions sont les bienvenues !
+
+1. Forkez le dépôt.
+2. Créez une branche pour votre fonctionnalité (`git checkout -b feature/ma-fonctionnalité`).
+3. Commitez vos modifications (`git commit -am 'Ajout de ma fonctionnalité'`).
+4. Poussez la branche (`git push origin feature/ma-fonctionnalité`).
+5. Créez une Pull Request.([GitHub][1])
+
+## 📬 Contact
+
+Pour toute question ou suggestion, veuillez ouvrir une issue sur le dépôt GitHub ou contacter [davidweb](https://github.com/davidweb).
+
+---
+
+N'hésite pas à adapter ce fichier `README.md` en fonction des évolutions de ton projet ou des spécificités supplémentaires que tu souhaites mettre en avant.
+
+[1]: https://github.com/davidweb?utm_source=chatgpt.com "davidweb (Neorak) · GitHub"
