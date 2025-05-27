@@ -1,4 +1,4 @@
-# Module-surveillance HLK-LD2410-ESP32-C3-ESP32
+# Module Surveillance HLK-LD2410-ESP32-C3-ESP32
 
 Système de surveillance intelligent basé sur des capteurs radar HLK-LD2410, conçu pour détecter la présence humaine, surveiller les postures (debout, assis, couché) et alerter en cas de chute. Chaque module capteur est piloté par un ESP32-C3, tandis qu'un ESP32-WROOM-32 centralise les données et gère les alertes.
 
