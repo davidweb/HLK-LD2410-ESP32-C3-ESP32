@@ -11,10 +11,18 @@
 #include "esp_event.h"   // For event loop
 #include "esp_netif.h"   // For TCP/IP stack
 #include "mqtt_client.h" // For MQTT
+#include "mdns.h"        // For mDNS
 
 static const char *TAG_MAIN = "slave_main";
+static const char *TAG_MDNS = "mdns_slave";
 static const char *TAG_RADAR = "RadarTask";
 static const char *TAG_WIFI = "WiFiTask";
+
+// Placeholder for MQTT Broker CA Certificate
+// Replace with your actual PEM-formatted CA certificate
+static const char *mqtt_broker_ca_cert_pem_start = "-----BEGIN CERTIFICATE-----\n"
+                                                "MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ\n"
+                                                "-----END CERTIFICATE-----\n"; // Note: This is a truncated placeholder
 
 // Wi-Fi Configuration
 #define EXAMPLE_ESP_WIFI_SSID      "your_wifi_ssid"
@@ -22,7 +30,7 @@ static const char *TAG_WIFI = "WiFiTask";
 #define EXAMPLE_ESP_MAXIMUM_RETRY  5 // Max retries for Wi-Fi connection
 
 // MQTT Configuration
-#define CONFIG_BROKER_URL          "mqtt://192.168.1.100" // Fictitious IP for now
+#define CONFIG_BROKER_URL          "mqtts://192.168.1.100:8883" // Changed to mqtts and port 8883
 #define MQTT_TOPIC_RADAR_DATA      "home/room1/radar1"    // Example MQTT topic
 #define MQTT_CLIENT_ID             "esp32c3_slave_radar_1" // Unique client ID
 
@@ -34,6 +42,18 @@ static EventGroupHandle_t s_wifi_event_group;
 // MQTT Client Handle
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 static bool mqtt_connected_flag = false;
+
+// Structure for radar data queue
+typedef struct {
+    float distance_m;
+    char posture[16];
+    int signal_strength;
+    uint32_t timestamp;
+} ProcessedRadarData;
+
+// Queue Handle for radar data
+static QueueHandle_t radar_output_queue;
+#define RADAR_QUEUE_SIZE 5
 
 
 // UART Configuration for Radar Module (already defined from previous step)
@@ -67,6 +87,9 @@ static void mqtt_publish_data(esp_mqtt_client_handle_t client, const char* topic
 void RadarTask_task(void *pvParameters);
 void WiFiTask_task(void *pvParameters);
 
+// mDNS Function Declaration
+static void start_mdns_service(void);
+
 
 void app_main(void)
 {
@@ -74,6 +97,20 @@ void app_main(void)
     
     // Initialize NVS - required for Wi-Fi
     nvs_init();
+
+    // Initialize Wi-Fi (STA mode)
+    wifi_init_sta(); // Call this before mDNS starts, as mDNS relies on network interface
+
+    // Start mDNS service
+    start_mdns_service();
+
+    // Create the radar data queue
+    radar_output_queue = xQueueCreate(RADAR_QUEUE_SIZE, sizeof(ProcessedRadarData));
+    if (radar_output_queue == NULL) {
+        ESP_LOGE(TAG_MAIN, "Failed to create radar_output_queue. Halting.");
+        while(1); // Halt if queue creation fails
+    }
+    ESP_LOGI(TAG_MAIN, "radar_output_queue created successfully.");
 
     // Create tasks
     xTaskCreate(&RadarTask_task, "RadarTask_task", 4096, NULL, 5, NULL);
@@ -119,6 +156,18 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG_WIFI, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+
+        // If MQTT client is initialized and not connected, try to reconnect now that Wi-Fi is up.
+        if (mqtt_client != NULL && !mqtt_connected_flag) {
+            ESP_LOGI(TAG_WIFI, "Wi-Fi (re)connected, attempting to reconnect MQTT client...");
+            esp_err_t err = esp_mqtt_client_reconnect(mqtt_client);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG_WIFI, "MQTT client reconnect initiated successfully.");
+                // MQTT_EVENT_CONNECTED will set mqtt_connected_flag = true
+            } else {
+                ESP_LOGE(TAG_WIFI, "Failed to initiate MQTT client reconnect: %s. Will retry in WiFiTask.", esp_err_to_name(err));
+            }
+        }
     }
 }
 
@@ -205,14 +254,20 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG_WIFI, "MQTT_EVENT_ERROR");
-        if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
-            // Log specific transport errors if needed
-            // ESP_LOGI(TAG_WIFI, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
-            // ESP_LOGI(TAG_WIFI, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
-        } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
-            ESP_LOGI(TAG_WIFI, "Connection refused error: 0x%x", event->error_handle->connect_return_code);
+        if (event->error_handle) { // Check if error_handle is not NULL
+            ESP_LOGE(TAG_WIFI, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
+            ESP_LOGE(TAG_WIFI, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
+            ESP_LOGE(TAG_WIFI, "MQTT error type: 0x%x", event->error_handle->error_type);
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                ESP_LOGI(TAG_WIFI, "TCP transport error: Last error code reported from esp-tls: 0x%x, Last tls stack error number: 0x%x", 
+                         event->error_handle->esp_tls_last_esp_err, event->error_handle->esp_tls_stack_err);
+            } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                ESP_LOGI(TAG_WIFI, "Connection refused error: 0x%x (Check broker, credentials, client ID)", event->error_handle->connect_return_code);
+            } else {
+                ESP_LOGW(TAG_WIFI, "Other MQTT error type: %d", event->error_handle->error_type);
+            }
         } else {
-            ESP_LOGW(TAG_WIFI, "Other MQTT error type: %d", event->error_handle->error_type);
+            ESP_LOGE(TAG_WIFI, "MQTT_EVENT_ERROR, but no error handle available.");
         }
         break;
     default:
@@ -224,6 +279,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
 static esp_mqtt_client_handle_t mqtt_app_start(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = CONFIG_BROKER_URL,
+        .broker.verification.certificate = mqtt_broker_ca_cert_pem_start,
         .credentials.client_id = MQTT_CLIENT_ID,
         // .session.last_will.topic = "/topic/will", // Example last will
         // .session.last_will.msg = "I am gone",
@@ -231,7 +287,7 @@ static esp_mqtt_client_handle_t mqtt_app_start(void) {
         // .session.last_will.retain = 0,
     };
 
-    ESP_LOGI(TAG_WIFI, "Starting MQTT client, broker: %s", CONFIG_BROKER_URL);
+    ESP_LOGI(TAG_WIFI, "Starting MQTT client, broker URI: %s", mqtt_cfg.broker.address.uri);
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
     if (client == NULL) {
         ESP_LOGE(TAG_WIFI, "Failed to initialize MQTT client");
@@ -278,7 +334,7 @@ static void mqtt_publish_data(esp_mqtt_client_handle_t client, const char* topic
 }
 
 
-// Radar Task (from previous step, unchanged)
+// Radar Task
 static void radar_uart_init() {
     uart_config_t uart_config = {
         .baud_rate = RADAR_UART_BAUDRATE,
@@ -295,10 +351,39 @@ static void radar_uart_init() {
     ESP_LOGI(TAG_RADAR, "UART Initialized. TX:%d, RX:%d", RADAR_TXD_PIN, RADAR_RXD_PIN);
 }
 
+// Static counter for radar_read_data simulation
+static int radar_read_attempt_counter = 0;
+
 static bool radar_read_data(float* distance_m, char* posture, int* signal_strength) {
-    *distance_m = 2.25f;
-    strcpy(posture, "LYING"); 
-    *signal_strength = 72;
+    radar_read_attempt_counter++;
+
+    // Simulate an error every 5th attempt
+    if (radar_read_attempt_counter % 5 == 0) {
+        ESP_LOGW(TAG_RADAR, "Simulated radar read error (attempt %d).", radar_read_attempt_counter);
+        // Reset posture to indicate error or unknown state
+        strcpy(posture, "ERROR");
+        *distance_m = 0.0f;
+        *signal_strength = 0;
+        return false; 
+    }
+
+    // Simulate successful read
+    // For variety, let's make posture change a bit too
+    if (radar_read_attempt_counter % 3 == 0) {
+        strcpy(posture, "SITTING");
+        *distance_m = 1.80f;
+        *signal_strength = 65;
+    } else if (radar_read_attempt_counter % 2 == 0) {
+        strcpy(posture, "MOVING");
+        *distance_m = 3.10f;
+        *signal_strength = 70;
+    } else {
+        strcpy(posture, "LYING"); // Default successful read
+        *distance_m = 2.25f;
+        *signal_strength = 72;
+    }
+    ESP_LOGD(TAG_RADAR, "Simulated successful radar read (attempt %d): dist=%.2f, post=%s, sig=%d", 
+             radar_read_attempt_counter, *distance_m, posture, *signal_strength);
     return true;
 }
 
@@ -320,24 +405,32 @@ void RadarTask_task(void *pvParameters) {
     float distance_m;
     char posture[16]; 
     int signal_strength;
-    char json_buffer[256]; 
+    char json_buffer[256];
+    ProcessedRadarData data_to_send;
 
     for(;;) {
-        ESP_LOGD(TAG_RADAR, "Simulating Radar Module ON"); 
-        vTaskDelay(pdMS_TO_TICKS(RADAR_PRE_READ_DELAY_MS)); 
+        ESP_LOGD(TAG_RADAR, "Simulating Radar Module ON");
+        vTaskDelay(pdMS_TO_TICKS(RADAR_PRE_READ_DELAY_MS));
 
-        if (radar_read_data(&distance_m, posture, &signal_strength)) {
-            uint32_t timestamp = esp_log_timestamp(); 
-            format_radar_json(json_buffer, sizeof(json_buffer), RADAR_MODULE_ID, timestamp, distance_m, posture, signal_strength);
-            ESP_LOGI(TAG_RADAR, "Generated JSON: \n%s", json_buffer);
+        if (radar_read_data(&data_to_send.distance_m, data_to_send.posture, &data_to_send.signal_strength)) {
+            data_to_send.timestamp = esp_log_timestamp();
+            ESP_LOGI(TAG_RADAR, "Read data: dist=%.2f, posture=%s, sig=%d, ts=%u",
+                     data_to_send.distance_m, data_to_send.posture, data_to_send.signal_strength, data_to_send.timestamp);
 
-            // --- TODO: Actual data passing to WiFiTask_task via queue/event ---
-            // For now, WiFiTask_task will generate its own dummy data.
+            if (radar_output_queue != NULL) {
+                if (xQueueSend(radar_output_queue, &data_to_send, pdMS_TO_TICKS(100)) != pdPASS) {
+                    ESP_LOGE(TAG_RADAR, "Failed to send data to radar_output_queue (queue full or error).");
+                } else {
+                    ESP_LOGD(TAG_RADAR, "Radar data sent to radar_output_queue.");
+                }
+            } else {
+                ESP_LOGE(TAG_RADAR, "radar_output_queue is NULL. Cannot send data.");
+            }
         } else {
-            ESP_LOGW(TAG_RADAR, "Failed to read data from radar module.");
+            ESP_LOGW(TAG_RADAR, "Failed to read data from radar module. Not sending to queue.");
         }
         ESP_LOGD(TAG_RADAR, "Simulating Radar Module OFF/Standby");
-        vTaskDelay(pdMS_TO_TICKS(RADAR_POST_READ_DELAY_MS)); 
+        vTaskDelay(pdMS_TO_TICKS(RADAR_POST_READ_DELAY_MS));
     }
 }
 
@@ -372,22 +465,118 @@ void WiFiTask_task(void *pvParameters) {
 
     // Only proceed to publish loop if MQTT client was initialized (which implies Wi-Fi connected)
     if (mqtt_client) {
-        char dummy_json_buffer[256]; // Buffer for dummy JSON data
+        char json_payload_buffer[256]; // Buffer for JSON data
+        ProcessedRadarData received_radar_data;
         for(;;) {
-            // Simulate generating or receiving radar data to send
-            // In a real system, this would come from RadarTask_task via a FreeRTOS queue
-            uint32_t current_timestamp = esp_log_timestamp();
-            format_radar_json(dummy_json_buffer, sizeof(dummy_json_buffer), 
-                              RADAR_MODULE_ID, current_timestamp, 
-                              1.5f, "SITTING", 80); // Example dummy data
+            if (radar_output_queue != NULL) {
+                if (xQueueReceive(radar_output_queue, &received_radar_data, pdMS_TO_TICKS(1000)) == pdPASS) { // Wait up to 1 sec
+                    ESP_LOGI(TAG_WIFI, "Received radar data from queue: dist=%.2f, post=%s, sig=%d, ts=%u",
+                             received_radar_data.distance_m, received_radar_data.posture,
+                             received_radar_data.signal_strength, received_radar_data.timestamp);
 
-            ESP_LOGI(TAG_WIFI, "WiFiTask: Publishing dummy data: %s", dummy_json_buffer);
-            mqtt_publish_data(mqtt_client, MQTT_TOPIC_RADAR_DATA, dummy_json_buffer);
+                    format_radar_json(json_payload_buffer, sizeof(json_payload_buffer),
+                                      RADAR_MODULE_ID, received_radar_data.timestamp,
+                                      received_radar_data.distance_m, received_radar_data.posture,
+                                      received_radar_data.signal_strength);
+
+                    ESP_LOGI(TAG_WIFI, "WiFiTask: Publishing formatted data: %s", json_payload_buffer);
+                    mqtt_publish_data(mqtt_client, MQTT_TOPIC_RADAR_DATA, json_payload_buffer);
+                } else {
+                    ESP_LOGD(TAG_WIFI, "No data received from radar_output_queue within timeout. Will try again.");
+                    // Optionally, publish a "heartbeat" or "no data" message if needed
+                }
+            } else {
+                ESP_LOGE(TAG_WIFI, "radar_output_queue is NULL. Cannot receive data. Delaying...");
+                vTaskDelay(pdMS_TO_TICKS(5000)); // Delay to avoid spamming logs
+            }
             
-            vTaskDelay(pdMS_TO_TICKS(10000)); // Publish every 10 seconds
+            // Check MQTT connection status and attempt reconnect if necessary
+            if (!mqtt_connected_flag) {
+                ESP_LOGW(TAG_WIFI, "MQTT not connected. Wi-Fi status: %s",
+                    (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) ? "Connected" : "Disconnected");
+                if ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) && mqtt_client != NULL) {
+                    ESP_LOGI(TAG_WIFI, "WiFiTask: Attempting to reconnect MQTT client...");
+                    esp_err_t err = esp_mqtt_client_reconnect(mqtt_client);
+                    // Alternatively, esp_mqtt_client_start(mqtt_client) can be used if reconnect fails.
+                    // start is more robust if the client was stopped for some reason.
+                    if (err != ESP_OK) {
+                         ESP_LOGE(TAG_WIFI, "WiFiTask: Failed to reconnect MQTT client: %s. Retrying start...", esp_err_to_name(err));
+                         err = esp_mqtt_client_start(mqtt_client);
+                         if (err != ESP_OK) {
+                            ESP_LOGE(TAG_WIFI, "WiFiTask: Failed to start MQTT client after reconnect failure: %s.", esp_err_to_name(err));
+                         } else {
+                            ESP_LOGI(TAG_WIFI, "WiFiTask: MQTT client start initiated after reconnect failure.");
+                         }
+                    } else {
+                        ESP_LOGI(TAG_WIFI, "WiFiTask: MQTT client reconnect initiated successfully.");
+                    }
+                }
+            }
+            // Delay before next attempt to receive from queue or check connections.
+            // This also serves as the retry interval for MQTT connection attempts if disconnected.
+            vTaskDelay(pdMS_TO_TICKS(5000)); // Check/Publish/Retry every 5 seconds
         }
     } else {
-        ESP_LOGE(TAG_WIFI, "MQTT client not available. WiFiTask will suspend itself.");
+        ESP_LOGE(TAG_WIFI, "MQTT client not available (initialization failed). WiFiTask will suspend itself.");
         vTaskSuspend(NULL); // Suspend itself as it cannot do its job
     }
+}
+
+static void start_mdns_service(void) {
+    esp_err_t err;
+
+    // Initialize mDNS
+    err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MDNS, "mDNS Init failed: %s", esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG_MDNS, "mDNS Initalized.");
+
+    // Set hostname
+    char hostname[32];
+    snprintf(hostname, sizeof(hostname), "esp32-slave-%d", RADAR_MODULE_ID);
+    err = mdns_hostname_set(hostname);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MDNS, "mdns_hostname_set failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG_MDNS, "mDNS hostname set to: %s", hostname);
+    }
+
+    // Set default instance
+    err = mdns_instance_name_set("ESP32 HLK-LD2410 Radar Sensor");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MDNS, "mdns_instance_name_set failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG_MDNS, "mDNS instance name set.");
+    }
+    
+    // Define service type and protocol
+    const char *service_type = "_hlk_radar";
+    const char *proto = "_tcp";
+    uint16_t port = 1234; // Placeholder port
+
+    // Convert RADAR_MODULE_ID to string for TXT record
+    char module_id_str[4]; // Max 3 digits for module ID + null terminator
+    snprintf(module_id_str, sizeof(module_id_str), "%d", RADAR_MODULE_ID);
+
+    // Define TXT records
+    mdns_txt_item_t service_txt_records[] = {
+        {"module_id", module_id_str},
+        {"version", "1.0"} // Example other record
+    };
+
+    // Add service
+    char instance_name_service[64];
+    snprintf(instance_name_service, sizeof(instance_name_service), "Radar Module %d", RADAR_MODULE_ID);
+    
+    err = mdns_service_add(instance_name_service, service_type, proto, port, service_txt_records, sizeof(service_txt_records) / sizeof(service_txt_records[0]));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MDNS, "mdns_service_add failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG_MDNS, "mDNS service %s added with type %s.%s on port %d.", instance_name_service, service_type, proto, port);
+    }
+
+    // Note: mdns_service_port_set can be used if port needs to change later
+    // mdns_free() should be called on deinit, but for this app, it runs indefinitely.
 }

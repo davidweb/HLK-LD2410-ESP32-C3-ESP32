@@ -11,15 +11,27 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "mqtt_client.h"
+#include "mdns.h"        // For mDNS
+#include "esp_http_server.h" // For HTTP Server
+#include "freertos/semphr.h" // For Mutex
+
 // Note: cJSON.h is not included as manual parsing will be implemented.
 
-static const char *TAG_MAIN_APP = "master_main"; 
+static const char *TAG_MAIN_APP = "master_main";
+static const char *TAG_HTTP_SERVER = "http_server";
+static const char *TAG_MDNS_DISCOVERY = "mdns_discovery";
 static const char *TAG_NETWORK = "NetworkManager";
 static const char *TAG_FUSION = "FusionEngine";
 static const char *TAG_FALL_DETECTOR = "FallDetector";
 static const char *TAG_ALERT_MANAGER = "AlertManager";
 static const char *TAG_WATCHDOG = "WatchdogTask";
 
+// Placeholder for MQTT Broker CA Certificate
+// Replace with your actual PEM-formatted CA certificate
+static const char *mqtt_broker_ca_cert_pem_start = "-----BEGIN CERTIFICATE-----\n"
+                                                "MIIDdzCCAl+gAwIBAgIEAgAAuTANBgkqhkiG9w0BAQUFADBaMQswCQYDVQQGEwJJ\n"
+                                                // ... (truncated for brevity)
+                                                "-----END CERTIFICATE-----\n";
 
 // Wi-Fi Configuration
 #define MASTER_ESP_WIFI_SSID      "your_master_wifi_ssid"
@@ -27,7 +39,7 @@ static const char *TAG_WATCHDOG = "WatchdogTask";
 #define MASTER_ESP_MAXIMUM_RETRY  5
 
 // MQTT Configuration
-#define MASTER_CONFIG_BROKER_URL          "mqtt://192.168.1.100" 
+#define MASTER_CONFIG_BROKER_URL          "mqtts://192.168.1.100:8883" // Changed to mqtts and port 8883
 #define HOME_MQTT_TOPIC_WILDCARD      "home/+/radar+"    
 #define MASTER_MQTT_CLIENT_ID             "esp32_master_controller_1"
 #define ALERT_TOPIC                       "home/room1/alert"
@@ -41,6 +53,20 @@ static EventGroupHandle_t wifi_event_group;
 // MQTT Client Handle and connection flag (file static, accessible within main.c)
 static esp_mqtt_client_handle_t client_handle = NULL;
 static bool mqtt_connected_flag = false;
+
+// Web Server Data Structure and Mutex
+typedef struct {
+    bool mqtt_connected;
+    bool module_status[NUM_SLAVE_MODULES]; // true for online, false for offline
+    char last_alerts[5][128]; // Store last 5 alert descriptions
+    int alert_write_index;    // Index for next alert to write (for circular buffer)
+    int stored_alert_count;   // Number of alerts actually stored (0 to 5)
+    uint32_t system_uptime_seconds; // System uptime
+} WebServerData;
+
+static WebServerData g_web_server_data;
+static SemaphoreHandle_t g_web_data_mutex;
+static httpd_handle_t http_server_handle = NULL; // Global handle for the server
 
 // Task Priorities (as per cahier des charges)
 #define NETWORK_TASK_PRIORITY    2
@@ -113,6 +139,7 @@ void FusionEngine_task(void *pvParameters);
 void FallDetector_task(void *pvParameters);
 void AlertManager_task(void *pvParameters);
 void Watchdog_task(void *pvParameters);
+void discover_radar_modules_task(void *pvParameters); // mDNS Discovery Task
 
 // Network related function declarations
 static void nvs_init();
@@ -124,6 +151,12 @@ static void master_mqtt_app_start(void);
 
 // Fusion Engine related function declarations
 static bool calculate_xy_position(float d1, float d2, float* x, float* y);
+
+// HTTP Server related function declarations
+static httpd_handle_t start_webserver(void);
+static esp_err_t root_get_handler(httpd_req_t *req);
+// No dedicated http_server_task, will start from wifi event handler
+static bool http_server_started_flag = false;
 
 
 void app_main(void)
@@ -153,14 +186,40 @@ void app_main(void)
     }
     ESP_LOGI(TAG_MAIN_APP, "alert_queue created successfully.");
 
+    // Create mutex for web server data
+    g_web_data_mutex = xSemaphoreCreateMutex();
+    if (g_web_data_mutex == NULL) {
+        ESP_LOGE(TAG_MAIN_APP, "Failed to create g_web_data_mutex. Halting.");
+        while(1);
+    }
+    ESP_LOGI(TAG_MAIN_APP, "g_web_data_mutex created successfully.");
+
+    // Initialize web server data (critical section)
+    if(xSemaphoreTake(g_web_data_mutex, portMAX_DELAY) == pdTRUE) {
+        g_web_server_data.mqtt_connected = false;
+        for (int i = 0; i < NUM_SLAVE_MODULES; i++) {
+            g_web_server_data.module_status[i] = false; // Initialize as offline
+        }
+        g_web_server_data.alert_write_index = 0;
+        g_web_server_data.stored_alert_count = 0;
+        for (int i = 0; i < 5; i++) {
+            strcpy(g_web_server_data.last_alerts[i], ""); // Clear alert strings
+        }
+        g_web_server_data.system_uptime_seconds = 0;
+        xSemaphoreGive(g_web_data_mutex);
+    }
+
+
     // Record system start time for Watchdog initial grace period
     system_start_time_ms = esp_log_timestamp(); 
 
-    xTaskCreate(&NetworkManager_task, "NetworkManager_task", 4096*2, NULL, NETWORK_TASK_PRIORITY, NULL); 
+    xTaskCreate(&NetworkManager_task, "NetworkManager_task", 4096*2, NULL, NETWORK_TASK_PRIORITY, NULL);
     xTaskCreate(&FusionEngine_task, "FusionEngine_task", 4096, NULL, FUSION_TASK_PRIORITY, NULL);
     xTaskCreate(&FallDetector_task, "FallDetector_task", 4096, NULL, FALL_DETECTION_TASK_PRIORITY, NULL);
     xTaskCreate(&AlertManager_task, "AlertManager_task", 4096, NULL, ALERT_TASK_PRIORITY, NULL);
-    xTaskCreate(&Watchdog_task, "Watchdog_task", 2048, NULL, WATCHDOG_TASK_PRIORITY, NULL); // Priority 10 as previously set
+    xTaskCreate(&Watchdog_task, "Watchdog_task", 2048, NULL, WATCHDOG_TASK_PRIORITY, NULL); 
+    xTaskCreate(&discover_radar_modules_task, "mdns_discover_task", 4096, NULL, 1, NULL); // Low priority for discovery
+    // HTTP server will be started by NetworkManager_task upon IP acquisition
 
     ESP_LOGI(TAG_MAIN_APP, "All tasks created.");
 }
@@ -202,7 +261,252 @@ static void master_wifi_event_handler(void* arg, esp_event_base_t event_base,
         ESP_LOGI(TAG_NETWORK, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
         s_master_retry_num = 0;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+
+        // If MQTT was initialized and is not connected, try to reconnect.
+        if (client_handle != NULL && !mqtt_connected_flag) {
+            ESP_LOGI(TAG_NETWORK, "Wi-Fi (re)connected, attempting to reconnect MQTT client...");
+            esp_err_t err = esp_mqtt_client_reconnect(client_handle);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG_NETWORK, "MQTT client reconnect initiated successfully.");
+                // Note: MQTT_EVENT_CONNECTED will set mqtt_connected_flag = true
+            } else {
+                ESP_LOGE(TAG_NETWORK, "Failed to initiate MQTT client reconnect: %s. Will retry in NetworkManager_task.", esp_err_to_name(err));
+                // esp_mqtt_client_start(client_handle) might be an alternative if reconnect fails persistently
+            }
+        }
+        // Start the web server if not already started and we have a valid handle reference
+        if (!http_server_started_flag && http_server_handle == NULL) {
+            http_server_handle = start_webserver(); // Attempt to start the server
+            if (http_server_handle != NULL) {
+                http_server_started_flag = true;
+                ESP_LOGI(TAG_NETWORK, "HTTP server started successfully.");
+            } else {
+                ESP_LOGE(TAG_NETWORK, "Failed to start HTTP server.");
+                // http_server_handle will remain NULL, so it might try again on next IP_EVENT_STA_GOT_IP if Wi-Fi reconnects.
+            }
+        } else if (http_server_started_flag && http_server_handle != NULL) {
+            ESP_LOGI(TAG_NETWORK, "HTTP server already started.");
+        } else if (http_server_handle == NULL) { // This case means previous attempts failed and we should retry
+             ESP_LOGW(TAG_NETWORK, "HTTP server not started, previous attempts failed. Retrying...");
+             http_server_handle = start_webserver();
+             if (http_server_handle != NULL) {
+                http_server_started_flag = true;
+                ESP_LOGI(TAG_NETWORK, "HTTP server started successfully after retry.");
+            } else {
+                ESP_LOGE(TAG_NETWORK, "Failed to start HTTP server on retry.");
+            }
+        }
     }
+}
+
+
+// HTTP Server Request Handler for Root Path
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    char*  buf;
+    size_t buf_len;
+
+    // Estimate buffer size (can be quite large for HTML)
+    // Increased to 1500 to accommodate more data and styling
+    buf_len = 1500; 
+    buf = malloc(buf_len);
+    if (!buf) {
+        ESP_LOGE(TAG_HTTP_SERVER, "Failed to allocate memory for HTTP response");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char temp_buffer[256]; // For individual lines/parts
+
+    if (xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        // Start HTML
+        snprintf(buf, buf_len, "<!DOCTYPE html><html><head><title>ESP32 Master Status</title>"
+                              "<meta http-equiv=\"refresh\" content=\"10\">" // Auto-refresh every 10 seconds
+                              "<style>"
+                              "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }"
+                              "h1 { color: #0056b3; }"
+                              "h2 { color: #0056b3; border-bottom: 1px solid #ccc; padding-bottom: 5px; }"
+                              ".status-ok { color: green; font-weight: bold; }"
+                              ".status-offline { color: red; font-weight: bold; }"
+                              "ul { list-style-type: none; padding-left: 0; }"
+                              "li { background-color: #fff; border: 1px solid #ddd; margin-bottom: 5px; padding: 10px; border-radius: 4px; }"
+                              ".container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }"
+                              "</style>"
+                              "</head><body><div class=\"container\"><h1>ESP32 Master Status</h1>");
+
+        // MQTT Status
+        snprintf(temp_buffer, sizeof(temp_buffer), "<p>MQTT Status: <span class=\"%s\">%s</span></p>",
+                 g_web_server_data.mqtt_connected ? "status-ok" : "status-offline",
+                 g_web_server_data.mqtt_connected ? "Connected" : "Disconnected");
+        strlcat(buf, temp_buffer, buf_len);
+
+        // System Uptime
+        uint32_t uptime_total_seconds = g_web_server_data.system_uptime_seconds;
+        uint32_t days = uptime_total_seconds / (24 * 3600);
+        uint32_t hours = (uptime_total_seconds % (24 * 3600)) / 3600;
+        uint32_t minutes = (uptime_total_seconds % 3600) / 60;
+        uint32_t seconds = uptime_total_seconds % 60;
+        snprintf(temp_buffer, sizeof(temp_buffer), "<p>System Uptime: %u days, %02u:%02u:%02u</p>", days, hours, minutes, seconds);
+        strlcat(buf, temp_buffer, buf_len);
+
+
+        // Module Status
+        strlcat(buf, "<h2>Module Status</h2>", buf_len);
+        for (int i = 0; i < NUM_SLAVE_MODULES; i++) {
+            snprintf(temp_buffer, sizeof(temp_buffer), "<p>Module %d: <span class=\"%s\">%s</span></p>",
+                     i + 1,
+                     g_web_server_data.module_status[i] ? "status-ok" : "status-offline",
+                     g_web_server_data.module_status[i] ? "Online" : "Offline");
+            strlcat(buf, temp_buffer, buf_len);
+        }
+
+        // Last Alerts
+        strlcat(buf, "<h2>Last Alerts</h2><ul>", buf_len);
+        if (g_web_server_data.stored_alert_count == 0) {
+            strlcat(buf, "<li>No alerts yet.</li>", buf_len);
+        } else {
+            // Display alerts in chronological order (oldest first from circular buffer)
+            for (int i = 0; i < g_web_server_data.stored_alert_count; i++) {
+                // Calculate the correct index to read from the circular buffer
+                int alert_idx = (g_web_server_data.alert_write_index - g_web_server_data.stored_alert_count + i + 5) % 5;
+                snprintf(temp_buffer, sizeof(temp_buffer), "<li>%s</li>", g_web_server_data.last_alerts[alert_idx]);
+                strlcat(buf, temp_buffer, buf_len);
+            }
+        }
+        strlcat(buf, "</ul>", buf_len);
+
+        xSemaphoreGive(g_web_data_mutex);
+    } else {
+        ESP_LOGE(TAG_HTTP_SERVER, "Failed to take g_web_data_mutex for HTTP handler");
+        snprintf(buf, buf_len, "<h1>Error fetching status</h1><p>Could not access system data. Please try again.</p>");
+        // No need to give mutex if not taken
+    }
+
+    // End HTML
+    strlcat(buf, "</div></body></html>", buf_len);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, buf, strlen(buf));
+
+    free(buf); // Free the buffer
+    return ESP_OK;
+}
+
+// HTTP Server URI Registration
+static const httpd_uri_t root_uri = {
+    .uri      = "/",
+    .method   = HTTP_GET,
+    .handler  = root_get_handler,
+    .user_ctx = NULL 
+};
+
+// Function to start the web server
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_open_sockets = 7; 
+    config.lru_purge_enable = true; 
+
+    ESP_LOGI(TAG_HTTP_SERVER, "Starting HTTP server on port: '%d'", config.server_port);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        ESP_LOGI(TAG_HTTP_SERVER, "Registering URI handlers");
+        httpd_register_uri_handler(server, &root_uri);
+        return server;
+    }
+
+    ESP_LOGE(TAG_HTTP_SERVER, "Error starting server!");
+    return NULL;
+}
+
+// Function to stop the webserver (optional, if needed for cleanup)
+/*
+static void stop_webserver(httpd_handle_t server)
+{
+    if (server) {
+        httpd_stop(server);
+    }
+}
+*/
+
+#define MDNS_QUERY_SERVICE_TYPE "_hlk_radar"
+#define MDNS_QUERY_PROTO "_tcp"
+#define MDNS_QUERY_INTERVAL_MS 30000 // Query every 30 seconds
+
+void discover_radar_modules_task(void *pvParameters) {
+    ESP_LOGI(TAG_MDNS_DISCOVERY, "mDNS discovery task started.");
+
+    esp_err_t err = mdns_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MDNS_DISCOVERY, "mDNS Init failed: %s", esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG_MDNS_DISCOVERY, "mDNS Initalized.");
+
+    err = mdns_hostname_set("esp32-master-controller");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_MDNS_DISCOVERY, "mdns_hostname_set (master) failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG_MDNS_DISCOVERY, "mDNS hostname set to: esp32-master-controller");
+    }
+    // Instance name for master is not strictly necessary for discovery only
+    // mdns_instance_name_set("ESP32 Master Fall Detection System");
+
+
+    mdns_result_t *results = NULL;
+
+    for (;;) {
+        ESP_LOGI(TAG_MDNS_DISCOVERY, "Querying for mDNS services...");
+        
+        err = mdns_query_ptr(MDNS_QUERY_SERVICE_TYPE, MDNS_QUERY_PROTO, 3000, 20, &results); // 3 sec timeout, max 20 results
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_MDNS_DISCOVERY, "mDNS query failed: %s", esp_err_to_name(err));
+            vTaskDelay(pdMS_TO_TICKS(MDNS_QUERY_INTERVAL_MS));
+            continue;
+        }
+
+        if (!results) {
+            ESP_LOGI(TAG_MDNS_DISCOVERY, "No mDNS services found.");
+        } else {
+            ESP_LOGI(TAG_MDNS_DISCOVERY, "Found %d mDNS services:", mdns_query_results_count(results)); // ESP-IDF v5+ way
+            mdns_result_t *r = results;
+            int i = 0;
+            while(r){
+                i++;
+                ESP_LOGI(TAG_MDNS_DISCOVERY, "--- Service #%d ---", i);
+                ESP_LOGI(TAG_MDNS_DISCOVERY, "  Instance: %s", r->instance_name ? r->instance_name : "N/A");
+                ESP_LOGI(TAG_MDNS_DISCOVERY, "  Hostname: %s", r->hostname ? r->hostname : "N/A");
+                ESP_LOGI(TAG_MDNS_DISCOVERY, "  Port: %u", r->port);
+                
+                // IP Addresses
+                for (int j = 0; j < r->addr_count; j++) {
+                    if (r->addr[j].addr.type == ESP_IPADDR_TYPE_V4) {
+                        ESP_LOGI(TAG_MDNS_DISCOVERY, "  IPv4[%d]: " IPSTR, j, IP2STR(&(r->addr[j].addr.u_addr.ip4)));
+                    }
+                    #if CONFIG_LWIP_IPV6
+                    else if (r->addr[j].addr.type == ESP_IPADDR_TYPE_V6) {
+                        ESP_LOGI(TAG_MDNS_DISCOVERY, "  IPv6[%d]: " IPV6STR, j, IPV62STR(r->addr[j].addr.u_addr.ip6));
+                    }
+                    #endif
+                }
+
+                // TXT Records
+                ESP_LOGI(TAG_MDNS_DISCOVERY, "  TXT Records (%d):", r->txt_count);
+                for (int k = 0; k < r->txt_count; k++) {
+                    ESP_LOGI(TAG_MDNS_DISCOVERY, "    %s = %s", r->txt[k].key, r->txt[k].value ? r->txt[k].value : "N/A");
+                     // TODO: Here you could parse module_id, e.g. if (strcmp(r->txt[k].key, "module_id") == 0) ...
+                }
+                r = r->next;
+            }
+            mdns_query_results_free(results);
+            results = NULL; // Important to reset for next query
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(MDNS_QUERY_INTERVAL_MS));
+    }
+    // mdns_free(); // Should be called on deinit
+    vTaskDelete(NULL); // Should not be reached in normal operation
 }
 
 static void master_wifi_init_sta(void)
@@ -317,12 +621,24 @@ static void master_mqtt_event_handler(void* handler_args, esp_event_base_t base,
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG_NETWORK, "MQTT_EVENT_CONNECTED to broker %s", MASTER_CONFIG_BROKER_URL);
         mqtt_connected_flag = true;
+        if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_web_server_data.mqtt_connected = true;
+            xSemaphoreGive(g_web_data_mutex);
+        } else {
+            ESP_LOGE(TAG_NETWORK, "Failed to take g_web_data_mutex for MQTT connect status.");
+        }
         msg_id = esp_mqtt_client_subscribe(client, HOME_MQTT_TOPIC_WILDCARD, 1); 
         ESP_LOGI(TAG_NETWORK, "Sent subscribe successful to topic %s, msg_id=%d", HOME_MQTT_TOPIC_WILDCARD, msg_id);
         break;
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(TAG_NETWORK, "MQTT_EVENT_DISCONNECTED");
         mqtt_connected_flag = false;
+        if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_web_server_data.mqtt_connected = false;
+            xSemaphoreGive(g_web_data_mutex);
+        } else {
+            ESP_LOGE(TAG_NETWORK, "Failed to take g_web_data_mutex for MQTT disconnect status.");
+        }
         break;
     case MQTT_EVENT_SUBSCRIBED:
         ESP_LOGI(TAG_NETWORK, "MQTT_EVENT_SUBSCRIBED, msg_id=%d", event->msg_id);
@@ -344,14 +660,14 @@ static void master_mqtt_event_handler(void* handler_args, esp_event_base_t base,
                      received_radar_msg.module_id, received_radar_msg.timestamp,
                      received_radar_msg.distance_m, received_radar_msg.posture, received_radar_msg.signal);
             
-            if (radar_data_queue != NULL) { 
-                if (xQueueSend(radar_data_queue, &received_radar_msg, pdMS_TO_TICKS(100)) == pdPASS) {
-                    ESP_LOGD(TAG_NETWORK, "Radar data sent to fusion_engine_queue successfully."); 
+            if (radar_data_queue != NULL) {
+                if (xQueueSend(radar_data_queue, &received_radar_msg, pdMS_TO_TICKS(100)) != pdPASS) {
+                    ESP_LOGE(TAG_NETWORK, "Failed to send radar data to radar_data_queue (queue full or error).");
                 } else {
-                    ESP_LOGE(TAG_NETWORK, "Failed to send radar data to fusion_engine_queue (queue full?).");
+                    ESP_LOGD(TAG_NETWORK, "Radar data sent to radar_data_queue successfully.");
                 }
             } else {
-                 ESP_LOGE(TAG_NETWORK, "radar_data_queue is NULL. Cannot send data.");
+                 ESP_LOGE(TAG_NETWORK, "radar_data_queue is NULL. Cannot send data."); // This check is good.
             }
         } else {
             ESP_LOGE(TAG_NETWORK, "Failed to parse incoming radar JSON data. Raw: %.*s", event->data_len, event->data);
@@ -359,6 +675,21 @@ static void master_mqtt_event_handler(void* handler_args, esp_event_base_t base,
         break;
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG_NETWORK, "MQTT_EVENT_ERROR");
+        if (event->error_handle) { // Check if error_handle is not NULL
+            ESP_LOGE(TAG_NETWORK, "Last error code reported from esp-tls: 0x%x", event->error_handle->esp_tls_last_esp_err);
+            ESP_LOGE(TAG_NETWORK, "Last tls stack error number: 0x%x", event->error_handle->esp_tls_stack_err);
+            ESP_LOGE(TAG_NETWORK, "MQTT error type: 0x%x", event->error_handle->error_type);
+            if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+                ESP_LOGI(TAG_NETWORK, "TCP transport error: Last error code reported from esp-tls: 0x%x, Last tls stack error number: 0x%x", 
+                         event->error_handle->esp_tls_last_esp_err, event->error_handle->esp_tls_stack_err);
+            } else if (event->error_handle->error_type == MQTT_ERROR_TYPE_CONNECTION_REFUSED) {
+                ESP_LOGI(TAG_NETWORK, "Connection refused error: 0x%x (Check broker, credentials, client ID, CA cert)", event->error_handle->connect_return_code);
+            } else {
+                ESP_LOGW(TAG_NETWORK, "Other MQTT error type: %d", event->error_handle->error_type);
+            }
+        } else {
+            ESP_LOGE(TAG_NETWORK, "MQTT_EVENT_ERROR, but no error handle available.");
+        }
         break;
     default:
         ESP_LOGI(TAG_NETWORK, "Other MQTT event id:%d", event->event_id);
@@ -369,10 +700,11 @@ static void master_mqtt_event_handler(void* handler_args, esp_event_base_t base,
 static void master_mqtt_app_start(void) {
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = MASTER_CONFIG_BROKER_URL,
+        .broker.verification.certificate = mqtt_broker_ca_cert_pem_start,
         .credentials.client_id = MASTER_MQTT_CLIENT_ID,
     };
 
-    ESP_LOGI(TAG_NETWORK, "Attempting to start MQTT client, broker: %s", MASTER_CONFIG_BROKER_URL);
+    ESP_LOGI(TAG_NETWORK, "Attempting to start MQTT client, broker URI: %s", mqtt_cfg.broker.address.uri);
     client_handle = esp_mqtt_client_init(&mqtt_cfg);
     if (client_handle == NULL) {
         ESP_LOGE(TAG_NETWORK, "Failed to initialize MQTT client");
@@ -410,13 +742,24 @@ void NetworkManager_task(void *pvParameters) {
 
     for(;;) {
         if (mqtt_connected_flag) {
-            ESP_LOGD(TAG_NETWORK, "NetworkManager: MQTT connection active."); 
+            ESP_LOGD(TAG_NETWORK, "NetworkManager: MQTT connection active.");
         } else {
             ESP_LOGW(TAG_NETWORK, "NetworkManager: MQTT connection lost or not established. Wi-Fi status: %s",
                 (xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) ? "Connected" : "Disconnected");
-            // TODO: Add robust MQTT reconnection logic here if Wi-Fi is connected.
+
+            // If Wi-Fi is connected, MQTT client is initialized, but MQTT is not connected, try to start/reconnect.
+            if ((xEventGroupGetBits(wifi_event_group) & WIFI_CONNECTED_BIT) && client_handle != NULL && !mqtt_connected_flag) {
+                ESP_LOGI(TAG_NETWORK, "NetworkManager_task: Wi-Fi is connected but MQTT is not. Attempting to start/reconnect MQTT client...");
+                esp_err_t err = esp_mqtt_client_start(client_handle); // Using start as it handles various states including initial start and reconnect after stop.
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG_NETWORK, "NetworkManager_task: MQTT client start/reconnect initiated successfully.");
+                    // MQTT_EVENT_CONNECTED will set mqtt_connected_flag = true
+                } else {
+                    ESP_LOGE(TAG_NETWORK, "NetworkManager_task: Failed to start/reconnect MQTT client: %s.", esp_err_to_name(err));
+                }
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(30000)); 
+        vTaskDelay(pdMS_TO_TICKS(30000)); // Check connection status periodically
     }
 }
 
@@ -438,13 +781,20 @@ void FusionEngine_task(void *pvParameters) {
 
     RadarMessage current_msg;
     float pos_x, pos_y;
-    char final_posture[16]; 
+    char final_posture[16];
 
     for(;;) {
-        if (xQueueReceive(radar_data_queue, &current_msg, portMAX_DELAY) == pdPASS) {
-            ESP_LOGI(TAG_FUSION, "Received data from module_id: %d, ts: %u, dist: %.2f, posture: %s, signal: %d",
-                     current_msg.module_id, current_msg.timestamp, current_msg.distance_m,
-                     current_msg.posture, current_msg.signal);
+        if (xQueueReceive(radar_data_queue, &current_msg, portMAX_DELAY) != pdPASS) {
+            ESP_LOGE(TAG_FUSION, "Error receiving from radar_data_queue. This should not happen with portMAX_DELAY unless queue is deleted.");
+            // If this happens, it might indicate a severe issue.
+            // Add a small delay here to prevent a tight loop if the queue is somehow problematic.
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue; // Skip the rest of the loop iteration
+        }
+        
+        ESP_LOGI(TAG_FUSION, "Received data from module_id: %d, ts: %u, dist: %.2f, posture: %s, signal: %d",
+                 current_msg.module_id, current_msg.timestamp, current_msg.distance_m,
+                 current_msg.posture, current_msg.signal);
 
             // Update last received timestamp for the specific module
             if (current_msg.module_id >= 1 && current_msg.module_id <= NUM_SLAVE_MODULES) {
@@ -455,6 +805,14 @@ void FusionEngine_task(void *pvParameters) {
                 if (module_offline_alerted[current_msg.module_id - 1]) {
                     ESP_LOGI(TAG_FUSION, "Module %d is back online.", current_msg.module_id);
                     module_offline_alerted[current_msg.module_id - 1] = false;
+                    if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        if (current_msg.module_id -1 < NUM_SLAVE_MODULES) { // Bounds check
+                           g_web_server_data.module_status[current_msg.module_id - 1] = true;
+                        }
+                        xSemaphoreGive(g_web_data_mutex);
+                    } else {
+                        ESP_LOGE(TAG_FUSION, "Failed to take g_web_data_mutex for module online status.");
+                    }
                     // Optional: Send MODULE_ONLINE alert
                     // AlertMessage online_alert;
                     // online_alert.type = ALERT_TYPE_MODULE_ONLINE;
@@ -508,13 +866,13 @@ void FusionEngine_task(void *pvParameters) {
                     fused_output_data.timestamp = (sensor1_data.timestamp > sensor2_data.timestamp) ? sensor1_data.timestamp : sensor2_data.timestamp;
                     
                     if (fusion_output_queue != NULL) {
-                        if (xQueueSend(fusion_output_queue, &fused_output_data, pdMS_TO_TICKS(100)) == pdPASS) {
-                            ESP_LOGD(TAG_FUSION, "Fused data sent to FallDetector_task queue.");
+                        if (xQueueSend(fusion_output_queue, &fused_output_data, pdMS_TO_TICKS(100)) != pdPASS) {
+                            ESP_LOGE(TAG_FUSION, "Failed to send fused data to fusion_output_queue (queue full or error).");
                         } else {
-                            ESP_LOGE(TAG_FUSION, "Failed to send fused data to FallDetector_task queue (queue full?).");
+                            ESP_LOGD(TAG_FUSION, "Fused data sent to fusion_output_queue.");
                         }
                     } else {
-                        ESP_LOGE(TAG_FUSION, "fusion_output_queue is NULL.");
+                        ESP_LOGE(TAG_FUSION, "fusion_output_queue is NULL."); // This check is good.
                     }
 
                     sensor1_data_valid = false;
@@ -549,9 +907,14 @@ void FallDetector_task(void *pvParameters) {
     FusedData current_data;
 
     for(;;) {
-        if (xQueueReceive(fusion_output_queue, &current_data, portMAX_DELAY) == pdPASS) {
-            ESP_LOGI(TAG_FALL_DETECTOR, "Received fused data: TS=%u, Pos=(%.2f, %.2f), Posture=%s",
-                     current_data.timestamp, current_data.x, current_data.y, current_data.final_posture);
+        if (xQueueReceive(fusion_output_queue, &current_data, portMAX_DELAY) != pdPASS) {
+            ESP_LOGE(TAG_FALL_DETECTOR, "Error receiving from fusion_output_queue. This should not happen with portMAX_DELAY unless queue is deleted.");
+            // Add a small delay here to prevent a tight loop if the queue is somehow problematic.
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue; // Skip the rest of the loop iteration
+        }
+        ESP_LOGI(TAG_FALL_DETECTOR, "Received fused data: TS=%u, Pos=(%.2f, %.2f), Posture=%s",
+                 current_data.timestamp, current_data.x, current_data.y, current_data.final_posture);
 
             if (previous_data_valid) {
                 bool was_upright_or_moving = (strcmp(previous_data.final_posture, STANDING_POSTURE) == 0) ||
@@ -589,13 +952,13 @@ void FallDetector_task(void *pvParameters) {
                                  (unsigned long)current_data.timestamp, current_data.x, current_data.y);
 
                         if (alert_queue != NULL) {
-                            if (xQueueSend(alert_queue, &alert_msg, pdMS_TO_TICKS(100)) == pdPASS) {
-                                ESP_LOGI(TAG_FALL_DETECTOR, "Fall alert sent to AlertManager_task queue.");
+                            if (xQueueSend(alert_queue, &alert_msg, pdMS_TO_TICKS(100)) != pdPASS) {
+                                ESP_LOGE(TAG_FALL_DETECTOR, "Failed to send fall alert to alert_queue (queue full or error).");
                             } else {
-                                ESP_LOGE(TAG_FALL_DETECTOR, "Failed to send fall alert to AlertManager_task queue.");
+                                ESP_LOGI(TAG_FALL_DETECTOR, "Fall alert sent to alert_queue.");
                             }
                         } else {
-                            ESP_LOGE(TAG_FALL_DETECTOR, "alert_queue is NULL!");
+                            ESP_LOGE(TAG_FALL_DETECTOR, "alert_queue is NULL!"); // This check is good.
                         }
                         
                         in_potential_fall_state = false;
@@ -621,25 +984,46 @@ void AlertManager_task(void *pvParameters) {
     char mqtt_payload[128];
 
     for(;;) {
-        if (xQueueReceive(alert_queue, &received_alert, portMAX_DELAY) == pdPASS) {
-            ESP_LOGI(TAG_ALERT_MANAGER, "Received alert. Type: %d, Description: %s, Timestamp: %u",
-                     received_alert.type, received_alert.description, received_alert.alert_timestamp);
+        if (xQueueReceive(alert_queue, &received_alert, portMAX_DELAY) != pdPASS) {
+            ESP_LOGE(TAG_ALERT_MANAGER, "Error receiving from alert_queue. This should not happen with portMAX_DELAY unless queue is deleted.");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue; 
+        }
+        ESP_LOGI(TAG_ALERT_MANAGER, "Received alert. Type: %d, Description: %s, Timestamp: %u",
+                 received_alert.type, received_alert.description, received_alert.alert_timestamp);
 
-            if (received_alert.type == ALERT_TYPE_FALL_DETECTED) {
-                snprintf(mqtt_payload, sizeof(mqtt_payload), 
-                         "{\"alert_type\": \"FALL_DETECTED\", \"description\": \"%s\", \"timestamp\": %u}", 
-                         received_alert.description, received_alert.alert_timestamp);
-            } else if (received_alert.type == ALERT_TYPE_MODULE_OFFLINE) {
-                snprintf(mqtt_payload, sizeof(mqtt_payload), 
-                         "{\"alert_type\": \"MODULE_OFFLINE\", \"description\": \"%s\", \"timestamp\": %u}", 
-                         received_alert.description, received_alert.alert_timestamp);
-            } else {
-                snprintf(mqtt_payload, sizeof(mqtt_payload), 
-                         "{\"alert_type\": \"UNKNOWN\", \"description\": \"%s\", \"timestamp\": %u}", 
-                         received_alert.description, received_alert.alert_timestamp);
+        // Update web server data with the new alert
+        if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // Use alert_write_index for circular buffer
+            strncpy(g_web_server_data.last_alerts[g_web_server_data.alert_write_index], 
+                    received_alert.description, 
+                    sizeof(g_web_server_data.last_alerts[0])-1);
+            g_web_server_data.last_alerts[g_web_server_data.alert_write_index][sizeof(g_web_server_data.last_alerts[0])-1] = '\\0'; // Ensure null termination
+            
+            g_web_server_data.alert_write_index = (g_web_server_data.alert_write_index + 1) % 5;
+            if (g_web_server_data.stored_alert_count < 5) {
+                g_web_server_data.stored_alert_count++;
             }
+            xSemaphoreGive(g_web_data_mutex);
+        } else {
+            ESP_LOGE(TAG_ALERT_MANAGER, "Failed to take g_web_data_mutex for updating alerts.");
+        }
 
-            ESP_LOGI(TAG_ALERT_MANAGER, "Prepared MQTT Payload: %s", mqtt_payload);
+        if (received_alert.type == ALERT_TYPE_FALL_DETECTED) {
+            snprintf(mqtt_payload, sizeof(mqtt_payload), 
+                     "{\"alert_type\": \"FALL_DETECTED\", \"description\": \"%s\", \"timestamp\": %u}", 
+                     received_alert.description, received_alert.alert_timestamp);
+        } else if (received_alert.type == ALERT_TYPE_MODULE_OFFLINE) {
+            snprintf(mqtt_payload, sizeof(mqtt_payload), 
+                     "{\"alert_type\": \"MODULE_OFFLINE\", \"description\": \"%s\", \"timestamp\": %u}", 
+                     received_alert.description, received_alert.alert_timestamp);
+        } else {
+            snprintf(mqtt_payload, sizeof(mqtt_payload), 
+                     "{\"alert_type\": \"UNKNOWN\", \"description\": \"%s\", \"timestamp\": %u}", 
+                     received_alert.description, received_alert.alert_timestamp);
+        }
+
+        ESP_LOGI(TAG_ALERT_MANAGER, "Prepared MQTT Payload: %s", mqtt_payload);
 
             if (mqtt_connected_flag && client_handle != NULL) {
                 int msg_id = esp_mqtt_client_publish(client_handle, ALERT_TOPIC, mqtt_payload, 0, 1, 0); 
@@ -658,6 +1042,137 @@ void AlertManager_task(void *pvParameters) {
     }
 }
 
+
+// HTTP Server Request Handler for Root Path
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    char*  buf;
+    size_t buf_len;
+
+    // Estimate buffer size (can be quite large for HTML)
+    // This is a rough estimate, adjust as needed, or use dynamic allocation carefully
+    buf_len = 1024; 
+    buf = malloc(buf_len);
+    if (!buf) {
+        ESP_LOGE(TAG_HTTP_SERVER, "Failed to allocate memory for HTTP response");
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    char temp_buffer[256]; // For individual lines/parts
+
+    if (xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        // Start HTML
+        snprintf(buf, buf_len, "<!DOCTYPE html><html><head><title>ESP32 Master Status</title>"
+                              "<meta http-equiv=\"refresh\" content=\"10\">" // Auto-refresh every 10 seconds
+                              "<style>"
+                              "body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }"
+                              "h1 { color: #0056b3; }"
+                              "h2 { color: #0056b3; border-bottom: 1px solid #ccc; padding-bottom: 5px; }"
+                              ".status-ok { color: green; }"
+                              ".status-offline { color: red; }"
+                              "ul { list-style-type: none; padding-left: 0; }"
+                              "li { background-color: #fff; border: 1px solid #ddd; margin-bottom: 5px; padding: 10px; border-radius: 4px; }"
+                              ".container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }"
+                              "</style>"
+                              "</head><body><div class=\"container\"><h1>ESP32 Master Status</h1>");
+
+        // MQTT Status
+        snprintf(temp_buffer, sizeof(temp_buffer), "<p>MQTT Status: <span class=\"%s\">%s</span></p>",
+                 g_web_server_data.mqtt_connected ? "status-ok" : "status-offline",
+                 g_web_server_data.mqtt_connected ? "Connected" : "Disconnected");
+        strlcat(buf, temp_buffer, buf_len);
+
+        // System Uptime
+        uint32_t uptime = g_web_server_data.system_uptime_seconds;
+        uint32_t days = uptime / (24 * 3600);
+        uptime = uptime % (24 * 3600);
+        uint32_t hours = uptime / 3600;
+        uptime = uptime % 3600;
+        uint32_t minutes = uptime / 60;
+        uint32_t seconds = uptime % 60;
+        snprintf(temp_buffer, sizeof(temp_buffer), "<p>System Uptime: %u days, %02u:%02u:%02u</p>", days, hours, minutes, seconds);
+        strlcat(buf, temp_buffer, buf_len);
+
+
+        // Module Status
+        strlcat(buf, "<h2>Module Status</h2>", buf_len);
+        for (int i = 0; i < NUM_SLAVE_MODULES; i++) {
+            snprintf(temp_buffer, sizeof(temp_buffer), "<p>Module %d: <span class=\"%s\">%s</span></p>",
+                     i + 1,
+                     g_web_server_data.module_status[i] ? "status-ok" : "status-offline",
+                     g_web_server_data.module_status[i] ? "Online" : "Offline");
+            strlcat(buf, temp_buffer, buf_len);
+        }
+
+        // Last Alerts
+        strlcat(buf, "<h2>Last Alerts</h2><ul>", buf_len);
+        if (g_web_server_data.stored_alert_count == 0) {
+            strlcat(buf, "<li>No alerts yet.</li>", buf_len);
+        } else {
+            // Display alerts in chronological order (oldest first from circular buffer)
+            for (int i = 0; i < g_web_server_data.stored_alert_count; i++) {
+                int alert_idx = (g_web_server_data.alert_write_index - g_web_server_data.stored_alert_count + i + 5) % 5;
+                snprintf(temp_buffer, sizeof(temp_buffer), "<li>%s</li>", g_web_server_data.last_alerts[alert_idx]);
+                strlcat(buf, temp_buffer, buf_len);
+            }
+        }
+        strlcat(buf, "</ul>", buf_len);
+
+        xSemaphoreGive(g_web_data_mutex);
+    } else {
+        ESP_LOGE(TAG_HTTP_SERVER, "Failed to take g_web_data_mutex for HTTP handler");
+        snprintf(buf, buf_len, "<h1>Error fetching status</h1><p>Could not access system data. Please try again.</p>");
+        // No need to give mutex if not taken
+    }
+
+    // End HTML
+    strlcat(buf, "</div></body></html>", buf_len);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, buf, strlen(buf));
+
+    free(buf); // Free the buffer
+    return ESP_OK;
+}
+
+// HTTP Server URI Registration
+static const httpd_uri_t root_uri = {
+    .uri      = "/",
+    .method   = HTTP_GET,
+    .handler  = root_get_handler,
+    .user_ctx = NULL 
+};
+
+// Function to start the web server
+static httpd_handle_t start_webserver(void)
+{
+    httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_open_sockets = 7; // Increased a bit
+    config.lru_purge_enable = true; // Enable LRU purge for inactive sockets
+
+    ESP_LOGI(TAG_HTTP_SERVER, "Starting HTTP server on port: '%d'", config.server_port);
+    if (httpd_start(&server, &config) == ESP_OK) {
+        ESP_LOGI(TAG_HTTP_SERVER, "Registering URI handlers");
+        httpd_register_uri_handler(server, &root_uri);
+        return server;
+    }
+
+    ESP_LOGE(TAG_HTTP_SERVER, "Error starting server!");
+    return NULL;
+}
+
+// Function to stop the webserver (optional, if needed for cleanup)
+/*
+static void stop_webserver(httpd_handle_t server)
+{
+    if (server) {
+        httpd_stop(server);
+    }
+}
+*/
+
 void Watchdog_task(void *pvParameters) {
     ESP_LOGI(TAG_WATCHDOG, "Watchdog_task started");
     // system_start_time_ms is initialized in app_main before this task starts.
@@ -665,6 +1180,14 @@ void Watchdog_task(void *pvParameters) {
     for(;;) {
         vTaskDelay(pdMS_TO_TICKS(WATCHDOG_CHECK_INTERVAL_S * 1000));
         uint32_t current_time_ms = esp_log_timestamp();
+        uint32_t uptime_seconds = (current_time_ms - system_start_time_ms) / 1000;
+
+        if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            g_web_server_data.system_uptime_seconds = uptime_seconds;
+            xSemaphoreGive(g_web_data_mutex);
+        } else {
+            ESP_LOGE(TAG_WATCHDOG, "Failed to take g_web_data_mutex for uptime update.");
+        }
 
         for (int i = 0; i < NUM_SLAVE_MODULES; i++) {
             bool initial_grace_period_passed = (current_time_ms - system_start_time_ms > (SLAVE_MODULE_TIMEOUT_S * 1000));
@@ -672,6 +1195,12 @@ void Watchdog_task(void *pvParameters) {
             if (last_received_timestamp_ms[i] == 0) { // Module has never sent data
                 if (initial_grace_period_passed && !module_offline_alerted[i]) {
                     ESP_LOGW(TAG_WATCHDOG, "Module %d has never sent data after initial timeout.", i + 1);
+                    if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        g_web_server_data.module_status[i] = false;
+                        xSemaphoreGive(g_web_data_mutex);
+                    } else {
+                        ESP_LOGE(TAG_WATCHDOG, "Failed to take g_web_data_mutex for module status (never reported).");
+                    }
                     
                     AlertMessage alert_msg;
                     alert_msg.type = ALERT_TYPE_MODULE_OFFLINE;
@@ -680,17 +1209,25 @@ void Watchdog_task(void *pvParameters) {
                     
                     if (alert_queue != NULL) {
                         if (xQueueSend(alert_queue, &alert_msg, pdMS_TO_TICKS(100)) != pdPASS) {
-                            ESP_LOGE(TAG_WATCHDOG, "Failed to send MODULE_OFFLINE alert (never reported) for module %d.", i + 1);
+                            ESP_LOGE(TAG_WATCHDOG, "Failed to send MODULE_OFFLINE alert (never reported) for module %d to alert_queue.", i + 1);
                         } else {
-                             ESP_LOGI(TAG_WATCHDOG, "MODULE_OFFLINE alert (never reported) for module %d sent.", i + 1);
+                             ESP_LOGI(TAG_WATCHDOG, "MODULE_OFFLINE alert (never reported) for module %d sent to alert_queue.", i + 1);
                         }
+                    } else {
+                        ESP_LOGE(TAG_WATCHDOG, "alert_queue is NULL. Cannot send MODULE_OFFLINE alert (never reported) for module %d.", i + 1);
                     }
-                    module_offline_alerted[i] = true;
+                    module_offline_alerted[i] = true; // Mark as alerted
                 }
             } else if ((current_time_ms - last_received_timestamp_ms[i]) > (SLAVE_MODULE_TIMEOUT_S * 1000)) {
                 // Module has sent data before, but not recently
-                if (!module_offline_alerted[i]) {
+                if (!module_offline_alerted[i]) { // Check if an offline alert for this timeout has already been sent
                     ESP_LOGW(TAG_WATCHDOG, "Module %d timed out. Last seen %u ms ago.", i + 1, current_time_ms - last_received_timestamp_ms[i]);
+                     if(xSemaphoreTake(g_web_data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                        g_web_server_data.module_status[i] = false;
+                        xSemaphoreGive(g_web_data_mutex);
+                    } else {
+                        ESP_LOGE(TAG_WATCHDOG, "Failed to take g_web_data_mutex for module status (timeout).");
+                    }
                     
                     AlertMessage alert_msg;
                     alert_msg.type = ALERT_TYPE_MODULE_OFFLINE;
@@ -699,12 +1236,14 @@ void Watchdog_task(void *pvParameters) {
                     
                     if (alert_queue != NULL) {
                          if (xQueueSend(alert_queue, &alert_msg, pdMS_TO_TICKS(100)) != pdPASS) {
-                            ESP_LOGE(TAG_WATCHDOG, "Failed to send MODULE_OFFLINE alert for module %d.", i + 1);
+                            ESP_LOGE(TAG_WATCHDOG, "Failed to send MODULE_OFFLINE alert (timeout) for module %d to alert_queue.", i + 1);
                         } else {
-                            ESP_LOGI(TAG_WATCHDOG, "MODULE_OFFLINE alert for module %d sent.", i + 1);
+                            ESP_LOGI(TAG_WATCHDOG, "MODULE_OFFLINE alert (timeout) for module %d sent to alert_queue.", i + 1);
                         }
+                    } else {
+                        ESP_LOGE(TAG_WATCHDOG, "alert_queue is NULL. Cannot send MODULE_OFFLINE alert (timeout) for module %d.", i + 1);
                     }
-                    module_offline_alerted[i] = true;
+                    module_offline_alerted[i] = true; // Mark as alerted
                 }
             } 
             // The case where module_offline_alerted[i] is true and the module comes back online
