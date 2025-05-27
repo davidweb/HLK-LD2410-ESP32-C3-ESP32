@@ -13,4 +13,5 @@ set(COMPONENT_ADD_INCLUDEDIRS "")
 #
 # or if no other components are required:
 idf_component_register(SRCS "${COMPONENT_SRCS}"
-                       INCLUDE_DIRS "${COMPONENT_ADD_INCLUDEDIRS}")
+                       INCLUDE_DIRS "${COMPONENT_ADD_INCLUDEDIRS}"
+                       PRIV_REQUIRES mdns esp_http_server)
