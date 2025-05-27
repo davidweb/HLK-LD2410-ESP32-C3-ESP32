@@ -57,20 +57,32 @@ Fournir une solution de surveillance non intrusive pour assurer la sécurité de
 
 ```
 Module-surveillance-v1-/
-├── capteur/
+├── master_firmware
 │   ├── main/
-│   │   ├── capteur.c
-│   │   └── ...
-│   └── ...
-├── maitre/
+│   │   ├── main.c
+│   │   └── CMakeLists.txt
+│   └── test/
+│   │   ├── CMakeLists.txt
+│   │   ├── test_alert_manager.c
+│   │   ├── test_fall_detector.c
+│   │   ├── test_fusion_engine.c
+│   │   └── test_main.c
+├── slave_firmware/
 │   ├── main/
-│   │   ├── maitre.c
-│   │   └── ...
-│   └── ...
+│   │   ├── main.c
+│   │   └── CMakeLists.txt
+│   └── test/
+│   │   ├── CMakeLists.txt
+│   │   ├── test_main.c
+│   │   ├── test_mqtt_utils.c
+│   │   └── test_radar_utils.c
 ├── docs/
-│   └── schema_architecture.png
+│   │   ├── CONFIGURATION_GUIDE.md
+│   │   ├── DEPLOYMENT_MAINTENANCE_GUIDE.md
+│   │   ├── FUTURE_IMPROVEMENTS.md
+│   │   ├── TESTING_SCENARIOS.md
+│   │   └── WIRING_DIAGRAM.md
 ├── README.md
-└── ...
 ```
 
 
@@ -91,6 +103,6 @@ Les contributions sont les bienvenues !
 
 ## 📬 Contact
 
-Pour toute question ou suggestion, veuillez ouvrir une issue sur le dépôt GitHub ou contacter [davidweb](https://github.com/davidweb).
+Pour toute question ou suggestion, veuillez ouvrir une issue sur le dépôt GitHub ou contacter [Neorak](https://github.com/davidweb).
 
 
