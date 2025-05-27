@@ -33,7 +33,7 @@ Fournir une solution de surveillance non intrusive pour assurer la sécurité de
 1. **Cloner le dépôt** :
 
    ```bash
-   git clone https://github.com/davidweb/Module-surveillance-v1-.git
+   git clone https://github.com/davidweb/HLK-LD2410-ESP32-C3-ESP32.git
    ```
 
 2. **Configurer les modules capteurs** :
